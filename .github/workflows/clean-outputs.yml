@@ -1,0 +1,39 @@
+# .github/workflows/clean-outputs.yml
+name: Clean Jupyter Outputs
+on:
+  push:
+    paths: ['**/*.ipynb']
+  pull_request:
+    paths: ['**/*.ipynb']
+  workflow_dispatch:  # Permet de déclencher manuellement depuis GitHub Actions
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    
+    - name: Install nbstripout
+      run: pip install nbstripout
+    
+    - name: Clean notebooks
+      run: |
+        files=$(git ls-files '*.ipynb')
+        for f in $files; do
+          # Ignore les fichiers vides ou JSON invalides (pas de notebook valide)
+          if [ -f "$f" ] && [ -s "$f" ] && python -m json.tool "$f" > /dev/null 2>&1; then
+            nbstripout "$f"
+          fi
+        done
+    
+    - name: Commit clean notebooks
+      run: |
+        git config user.name "Notebook Cleaner"
+        git config user.email "bot@clean.com"
+        if git diff --quiet -- '*.ipynb'; then
+          echo "No changes"
+        else
+          git add '*.ipynb'
+          git commit -m "🤖 Auto-clean Jupyter outputs [skip ci]"
+          git push
+        fi

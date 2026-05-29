@@ -1,0 +1,281 @@
+# docker-compose.prod.yml
+# Déploiement production — toutes les configs sont baked dans les images GHCR.
+# Aucun bind mount sur des fichiers de config — seules les données runtime sont en volumes.
+# Usage : docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
+     
+networks:
+  jobmarket-net:
+    driver: bridge
+
+services:
+  # Image custom — scripts SQL d'init baked dans l'image (Dockerfile.postgres.prod)
+  jobmarket-postgres:
+    cpus: "2.0"
+    mem_limit: 4g
+    memswap_limit: 4g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/postgres:latest
+    container_name: jobmarket-postgres
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - jobdb-data:/var/lib/postgresql/data
+
+  # Image publique — données runtime dans un volume nommé
+  jobmarket-minio:
+    cpus: "0.5"
+    mem_limit: 1g
+    memswap_limit: 1g
+    image: minio/minio:latest
+    container_name: jobmarket-minio
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  # Image publique — init du bucket au démarrage
+  jobmarket-minio-init:
+    image: minio/mc:latest
+    container_name: jobmarket-minio-init
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-minio
+    entrypoint: >
+      /bin/sh -lc "
+      mc alias set jobmarket http://jobmarket-minio:9000 ${S3_ACCESS_KEY} ${S3_SECRET_KEY} &&
+      mc mb -p jobmarket/jobmarket || true &&
+      echo 'Bucket ready: jobmarket'
+      "
+    restart: "no"
+
+  # Image custom — src baked dans l'image (Dockerfile.api)
+  jobmarket-api:
+    cpus: "4.0"
+    mem_limit: 8g
+    memswap_limit: 16g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/api:latest
+    container_name: jobmarket-api
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    depends_on:
+      - jobmarket-minio-init
+      - jobmarket-postgres
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: http://jobmarket-minio:9000
+      JOBSTORE_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@jobmarket-postgres:5432/${POSTGRES_DB}
+      PUSHGATEWAY_URL: http://jobmarket-pushgateway:9091
+    volumes:
+      - api-logs:/app/logs
+
+  # Image custom — dashboards et provisioning baked dans l'image (Dockerfile.grafana.prod)
+  jobmarket-grafana:
+    cpus: "0.5"
+    mem_limit: 512m
+    memswap_limit: 1g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/grafana:latest
+    container_name: jobmarket-grafana
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-postgres
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=${GF_USERS_ALLOW_SIGN_UP:-false}
+      - GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION=${GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION:-false}
+      - GF_DATE_FORMATS_DEFAULT_TIMEZONE=browser
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  # Image custom — servers.json et requêtes baked dans l'image (Dockerfile.pgadmin.prod)
+  jobmarket-pgadmin:
+    cpus: "0.5"
+    mem_limit: 512m
+    memswap_limit: 512m
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/pgadmin:latest
+    container_name: jobmarket-pgadmin
+    restart: unless-stopped
+    # Docker crée le dossier intermédiaire storage/ en root lors du bind mount
+    # de ./pgadmin/queries dans storage/willramarques_gmail.com.
+    # On démarre en root pour chowner storage/ (uid 5050 = pgadmin),
+    # puis on exec l'entrypoint original qui lance gunicorn.
+    user: "0:0"
+    entrypoint: >
+      /bin/sh -c "
+      chown -R 5050:0 /var/lib/pgadmin/storage &&
+      exec /entrypoint.sh
+      "
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-postgres
+    ports:
+      - "5050:80"
+    env_file:
+      - .env
+    environment:
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "false"
+      PGADMIN_CONFIG_COOKIE_DEFAULT_SECURE: "false"
+      PGADMIN_CONFIG_COOKIE_SAMESITE: "'Lax'"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+
+  # Image custom — src et dags baked dans l'image (Dockerfile.airflow.prod)
+  jobmarket-airflow:
+    cpus: "4.0"
+    mem_limit: 12g
+    memswap_limit: 16g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/airflow:latest
+    container_name: jobmarket-airflow
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-postgres
+      - jobmarket-api
+    env_file:
+      - .env
+    environment:
+      # Variables qui ne peuvent pas être dans .env :
+      # - SQL_ALCHEMY_CONN : hostname réseau Docker (jobmarket-postgres:5432) non résolvable hors conteneur
+      # - SIMPLE_AUTH_MANAGER_USERS : interpolation ${VAR} non supportée dans env_file
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@jobmarket-postgres:5432/airflow
+      # Format attendu : "username:ROLE" — ADMIN est le rôle Airflow (pas le mot de passe)
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:ADMIN"
+      PYTHONPATH: /opt/airflow
+      STORAGE_BACKEND: s3
+      # Override .env : localhost non résolvable depuis le container — réseau Docker interne
+      S3_ENDPOINT_URL: http://jobmarket-minio:9000
+      # Pas de tuning pour le cap_search — chaque run doit être rapide
+      TUNING_STRATEGY: none
+    ports:
+      - "8080:8080"
+    volumes:
+      - airflow-logs:/opt/airflow/logs
+    # Séquence de démarrage :
+    # 1. db migrate      — initialise le schéma de métadonnées Airflow
+    # 2. python3         — écrit simple_auth_passwords.json (auth Airflow 3.x, mots de passe en clair)
+    # 3. connections     — supprime puis recrée la connexion HTTP vers l'API jobmarket.
+    # 4. standalone      — démarre scheduler + api-server + dag-processor
+    command: >-
+      bash -c
+      "airflow db migrate &&
+      python3 -c 'import json,os; u=os.environ.get(\"AIRFLOW_ADMIN_USER\",\"admin\"); p=os.environ.get(\"AIRFLOW_ADMIN_PASSWORD\",\"admin\"); open(\"/opt/airflow/simple_auth_passwords.json\",\"w\").write(json.dumps({u:p})+\"\\n\")' &&
+      airflow connections delete jobmarket_api 2>/dev/null; airflow connections add jobmarket_api --conn-type http --conn-host jobmarket-api --conn-port 8000 &&
+      airflow standalone"
+
+  # Image custom — src baked dans l'image (Dockerfile.streamlit.prod)
+  jobmarket-streamlit:
+    cpus: "1"
+    mem_limit: 1g
+    memswap_limit: 2g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/streamlit:latest
+    container_name: jobmarket-streamlit
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-postgres
+    env_file:
+      - .env
+    environment:
+      JOBSTORE_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@jobmarket-postgres:5432/${POSTGRES_DB}
+    ports:
+      - "8501:8501"
+
+  # Image custom — prometheus.yml baked dans l'image (Dockerfile.prometheus.prod)
+  jobmarket-prometheus:
+    cpus: "0.5"
+    mem_limit: 512m
+    memswap_limit: 1g
+    image: ghcr.io/datastientest-studio/jan26_bde_jobmarket/prometheus:latest
+    container_name: jobmarket-prometheus
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Image publique — pas de config locale
+  jobmarket-pushgateway:
+    cpus: "0.25"
+    mem_limit: 128m
+    memswap_limit: 256m
+    image: prom/pushgateway:latest
+    container_name: jobmarket-pushgateway
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    ports:
+      - "9091:9091"
+    volumes:
+      - pushgateway-data:/data
+    command:
+      - '--persistence.file=/data/pushgateway.db'
+
+  # Image publique — pas de config locale
+  jobmarket-postgres-exporter:
+    cpus: "0.25"
+    mem_limit: 128m
+    memswap_limit: 256m
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: jobmarket-postgres-exporter
+    restart: unless-stopped
+    networks:
+      - jobmarket-net
+    depends_on:
+      - jobmarket-postgres
+    ports:
+      - "9187:9187"
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@jobmarket-postgres:5432/${POSTGRES_DB}?sslmode=disable
+
+volumes:
+  grafana-data:
+  jobdb-data:
+  pgadmin-data:
+  airflow-logs:
+  prometheus-data:
+  pushgateway-data:
+  minio-data:
+  api-logs:

@@ -1,0 +1,1164 @@
+"""
+Toutes les fonctions de chargement de données depuis PostgreSQL.
+Chaque fonction accepte un paramètre `filters_key` (str) pour invalider
+le cache @st.cache_data, et lit les filtres actifs via st.session_state.
+"""
+import pandas as pd
+import streamlit as st
+from sqlalchemy import text
+from utils.db import get_engine, _sql
+from config import DB_TTL
+
+# ── Construction de la clause WHERE dynamique ─────────────────────────────────
+
+def _in_clause(column: str, values: list, key_prefix: str, params: dict) -> str:
+    placeholders = []
+    for i, value in enumerate(values):
+        key = f"{key_prefix}_{i}"
+        placeholders.append(f":{key}")
+        params[key] = value
+    return f"{column} IN ({', '.join(placeholders)})"
+
+
+def _build_where(filters: dict) -> tuple[str, dict]:
+    clauses = []
+    params = {}
+
+    if filters.get("regions"):
+        clauses.append(_in_clause("g.nom_region", filters["regions"], "region", params))
+
+    if filters.get("departements"):
+        clauses.append(_in_clause("g.nom_departement", filters["departements"], "departement", params))
+
+    if filters.get("villes"):
+        clauses.append(_in_clause("g.nom_commune", filters["villes"], "ville", params))
+
+    if filters.get("contrats"):
+        clauses.append(_in_clause("c.contract_type", filters["contrats"], "contrat", params))
+
+    if filters.get("secteurs"):
+        clauses.append(_in_clause("r.rome_label", filters["secteurs"], "secteur", params))
+
+    if filters.get("entreprises"):
+        clauses.append(_in_clause("cp.company_name", filters["entreprises"], "entreprise", params))
+
+    if filters.get("postes"):
+        params["postes"] = f"%{filters['postes']}%"
+        clauses.append("f.job_title ILIKE :postes")
+
+    if filters.get("date_debut"):
+        params["date_debut"] = filters["date_debut"]
+        clauses.append("f.published_at >= :date_debut")
+
+    if filters.get("date_fin"):
+        params["date_fin"] = f"{filters['date_fin']} 23:59:59"
+        clauses.append("f.published_at <= :date_fin")
+
+    return (("AND " + " AND ".join(clauses)) if clauses else "", params)
+
+
+# ── JOINs conditionnels ───────────────────────────────────────────────────────
+
+def _geo_join(filters: dict) -> str:
+    if any(filters.get(k) for k in ("regions", "departements", "villes")):
+        return "JOIN gold.dim_geo g ON g.geo_key = f.geo_key"
+    return ""
+
+def _contrat_join(filters: dict) -> str:
+    if filters.get("contrats"):
+        return "JOIN gold.dim_type_contrat c ON c.contract_key = f.contract_key"
+    return ""
+
+def _rome_join(filters: dict) -> str:
+    if filters.get("secteurs"):
+        return "JOIN gold.dim_code_rome r ON r.rome_key = f.rome_key"
+    return ""
+
+
+def _company_join(filters: dict) -> str:
+    if filters.get("entreprises"):
+        return "JOIN gold.dim_company cp ON cp.company_key = f.company_key"
+    return ""
+
+
+# ── Options sidebar (régions, départements, contrats) ─────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_filter_options():
+    engine = get_engine()
+
+    regions = _sql(
+        "SELECT DISTINCT nom_region FROM gold.dim_geo "
+        "WHERE nom_region IS NOT NULL AND code_region != 'UNKNOWN' "
+        "ORDER BY nom_region",
+        engine,
+    )["nom_region"].tolist()
+
+    departements = _sql(
+        "SELECT DISTINCT nom_departement, nom_region FROM gold.dim_geo "
+        "WHERE nom_departement IS NOT NULL AND code_departement != 'UNKNOWN' "
+        "ORDER BY nom_departement",
+        engine,
+    )
+
+    contrats = _sql(
+        "SELECT DISTINCT contract_type FROM gold.dim_type_contrat "
+        "WHERE contract_type != 'UNKNOWN' ORDER BY contract_type",
+        engine,
+    )["contract_type"].tolist()
+
+    return {"regions": regions, "departements": departements, "contrats": contrats}
+
+
+# ── Recherche dynamique villes ────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def search_villes(prefix: str, regions: tuple = (), departements: tuple = ()) -> list:
+    """Retourne les villes commençant par `prefix` (min 2 caractères)."""
+    if len(prefix) < 2:
+        return []
+    engine = get_engine()
+    params = {"prefix": f"{prefix}%"}
+    clauses = ["nom_commune ILIKE :prefix", "nom_commune IS NOT NULL"]
+    if regions:
+        clauses.append(_in_clause("nom_region", list(regions), "region", params))
+    if departements:
+        clauses.append(_in_clause("nom_departement", list(departements), "departement", params))
+    where = " AND ".join(clauses)
+    sql = f"SELECT DISTINCT nom_commune FROM gold.dim_geo WHERE {where} ORDER BY nom_commune LIMIT 50"
+    return _sql(sql, engine, params=params)["nom_commune"].tolist()
+
+
+# ── Recherche dynamique ROME ──────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def search_rome(query: str) -> list:
+    """Recherche par libellé (ILIKE %query%) ou code (ILIKE query%) — min 2 caractères."""
+    if len(query) < 2:
+        return []
+    engine = get_engine()
+    params = {"query_contains": f"%{query}%", "query_prefix": f"{query}%"}
+    sql = f"""
+        SELECT DISTINCT rome_code, rome_label
+        FROM gold.dim_code_rome
+        WHERE rome_code != 'UNKNOWN'
+          AND (rome_label ILIKE :query_contains OR rome_code ILIKE :query_prefix)
+        ORDER BY rome_label
+        LIMIT 50
+    """
+    return _sql(sql, engine, params=params).to_dict("records")
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def search_entreprises(query: str) -> list:
+    """Recherche d'entreprises par préfixe/contient (min 2 caractères)."""
+    if len(query) < 2:
+        return []
+    engine = get_engine()
+    params = {"query_contains": f"%{query}%", "query_prefix": f"{query}%"}
+    sql = """
+        SELECT DISTINCT company_name
+        FROM gold.dim_company
+        WHERE company_name IS NOT NULL
+          AND company_name != ''
+          AND company_name != 'UNKNOWN'
+          AND (company_name ILIKE :query_contains OR company_name ILIKE :query_prefix)
+        ORDER BY company_name
+        LIMIT 50
+    """
+    return _sql(sql, engine, params=params)["company_name"].tolist()
+
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_kpi_global(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            COUNT(*)                                            AS total_offres,
+            COUNT(*) FILTER (
+                WHERE f.salary_min_computed IS NOT NULL
+                  AND f.salary_max_computed IS NOT NULL
+                  AND f.salary_min_computed > 0
+                  AND f.salary_max_computed < 200000
+            )                                                   AS offres_salaire_renseigne,
+            COUNT(DISTINCT f.company_key)                      AS nb_entreprises,
+            ROUND(AVG(f.salary_min_computed + f.salary_max_computed) / 2.0, 0)   AS salaire_moyen,
+            COUNT(*) FILTER (WHERE f.status = 'published')      AS offres_actives,
+            COUNT(*) FILTER (
+                WHERE f.published_at IS NOT NULL
+                  AND f.published_at >= NOW() - INTERVAL '7 days'
+                  AND f.published_at <= NOW()
+            )                                                   AS offres_7j,
+            COUNT(*) FILTER (WHERE f.published_at >= NOW() - INTERVAL '30 days') AS offres_30j,
+            COUNT(*) FILTER (WHERE f.published_at >= NOW() - INTERVAL '90 days') AS offres_90j,
+            COUNT(*) FILTER (
+                WHERE f.unpublished_at IS NOT NULL
+                  AND f.published_at IS NOT NULL
+                  AND f.unpublished_at > f.published_at
+                  AND f.unpublished_at >= NOW() - INTERVAL '14 days'
+                AND f.unpublished_at <= NOW()
+            )                                                   AS offres_pourvues,
+            ROUND(AVG(
+                EXTRACT(EPOCH FROM (f.unpublished_at - f.published_at)) / 86400.0
+            ) FILTER (
+                WHERE f.published_at IS NOT NULL
+                  AND f.unpublished_at IS NOT NULL
+                  AND f.unpublished_at > f.published_at
+                  AND EXTRACT(EPOCH FROM (f.unpublished_at - f.published_at)) < 86400 * 365
+            ), 1)                                               AS duree_moyenne_jours
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE 1=1 {where_sql}
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_contrats(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT c.contract_type, COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_type_contrat c ON c.contract_key = f.contract_key
+        {_geo_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE c.contract_type != 'UNKNOWN' {where_sql}
+        GROUP BY c.contract_type ORDER BY nb DESC LIMIT 10
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_contrats_salaire_stats(filters_key: str = ""):
+    """Contrats avec nb_offres + stats salaires (min/p25/moy/p75/max)."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            c.contract_type,
+            COUNT(*) AS nb,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_type_contrat c ON c.contract_key = f.contract_key
+        {_geo_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE c.contract_type != 'UNKNOWN' {where_sql}
+        GROUP BY c.contract_type
+        ORDER BY nb DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_anciennete(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT e.experience_level, COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_experience e ON e.experience_key = f.experience_key
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE e.experience_level != 'UNKNOWN' {where_sql}
+        GROUP BY e.experience_level ORDER BY nb DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_anciennete_salaire_stats(filters_key: str = ""):
+    """Ancienneté avec nb_offres + stats salaires (min/p25/moy/p75/max)."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            e.experience_level,
+            COUNT(*) AS nb,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_experience e ON e.experience_key = f.experience_key
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE e.experience_level != 'UNKNOWN' {where_sql}
+        GROUP BY e.experience_level
+        ORDER BY nb DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_offres_par_jour(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT f.published_at::date AS jour, COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.published_at IS NOT NULL {where_sql}
+        GROUP BY 1 ORDER BY 1
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_regions(filters_key: str = ""):
+    """Régions avec nb_offres + stats salariales complètes (min/p25/moy/p75/max)."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            g.nom_region,
+            g.code_region,
+            COUNT(*) AS nb_offres,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE g.nom_region IS NOT NULL
+          AND g.code_region != 'UNKNOWN'
+          {where_sql}
+        GROUP BY g.nom_region, g.code_region
+        ORDER BY nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_departements(filters_key: str = ""):
+    """Départements avec nb_offres + stats salariales complètes (min/p25/moy/p75/max)."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            g.nom_departement,
+            g.code_departement,
+            g.nom_region,
+            COUNT(*) AS nb_offres,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE g.nom_departement IS NOT NULL
+          AND g.code_departement != 'UNKNOWN'
+          {where_sql}
+        GROUP BY g.nom_departement, g.code_departement, g.nom_region
+        ORDER BY nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_top_villes(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            g.nom_commune,
+            g.nom_departement,
+            g.nom_region,
+            COUNT(*) AS nb_offres,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                               AND f.salary_max_computed IS NOT NULL
+                               AND f.salary_min_computed > 0
+                               AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE g.nom_commune IS NOT NULL
+          {where_sql}
+        GROUP BY g.nom_commune, g.nom_departement, g.nom_region
+        ORDER BY nb_offres DESC
+        LIMIT 200
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_nb_offres_salaire_renseigne(filters_key: str = ""):
+    """Nombre d'offres dont le salaire (min/max) est présent et plausible."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT COUNT(*) AS nb_offres_salaire_renseigne
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE 1=1 {where_sql}
+          AND f.salary_min_computed IS NOT NULL
+          AND f.salary_max_computed IS NOT NULL
+          AND f.salary_min_computed > 0
+          AND f.salary_max_computed < 200000
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_salaires_distrib(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            f.salary_min_computed, f.salary_max_computed,
+            (f.salary_min_computed + f.salary_max_computed) / 2.0 AS salaire_moyen,
+            f.source
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.salary_min_computed IS NOT NULL
+          AND f.salary_max_computed IS NOT NULL
+          AND f.salary_min_computed > 0
+          AND f.salary_max_computed < 200000
+          {where_sql}
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_salaires_par_contrat(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            c.contract_type,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS p25,
+            ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS p75,
+            COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_type_contrat c ON c.contract_key = f.contract_key
+        {_geo_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.salary_min_computed IS NOT NULL
+          AND f.salary_max_computed IS NOT NULL
+          AND f.salary_min_computed > 0
+          AND c.contract_type != 'UNKNOWN'
+          {where_sql}
+        GROUP BY c.contract_type
+        HAVING COUNT(*) > 10
+        ORDER BY salaire_moyen DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_salaires_par_rome(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            r.rome_label, r.rome_code,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_p25,
+            ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_p75,
+            ROUND(MIN((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_min,
+            ROUND(MAX((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_max,
+            COUNT(*) AS nb_offres
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_code_rome r ON r.rome_key = f.rome_key
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)}
+        WHERE f.salary_min_computed IS NOT NULL
+          AND f.salary_max_computed IS NOT NULL
+          AND f.salary_min_computed > 0
+          AND r.rome_code != 'UNKNOWN'
+          {where_sql}
+        GROUP BY r.rome_label, r.rome_code
+        HAVING COUNT(*) >= 5
+        ORDER BY nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_salaires_par_region(filters_key: str = ""):
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            g.nom_region,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_p25,
+            ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_p75,
+            ROUND(MIN((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_min,
+            ROUND(MAX((f.salary_min_computed + f.salary_max_computed) / 2.0), 0) AS salaire_max,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS mediane,
+            COUNT(*) AS nb_offres
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.salary_min_computed IS NOT NULL
+          AND f.salary_max_computed IS NOT NULL
+          AND f.salary_min_computed > 0
+          AND g.nom_region IS NOT NULL
+          AND g.code_region != 'UNKNOWN'
+          {where_sql}
+        GROUP BY g.nom_region
+        HAVING COUNT(*) >= 5
+        ORDER BY nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+# ── Données carte ─────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_carte_regions():
+    engine = get_engine()
+    return pd.read_sql("""
+        SELECT
+            g.nom_region                                            AS nom,
+            g.code_region                                          AS code,
+            COUNT(*)                                               AS nb_offres,
+            COUNT(DISTINCT f.company_key)                         AS nb_entreprises,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0), 0)    AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_mediane,
+            COUNT(*) FILTER (WHERE f.published_at >= NOW() - INTERVAL '30 days') AS offres_30j
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        WHERE g.nom_region IS NOT NULL
+          AND g.code_region != 'UNKNOWN'
+        GROUP BY g.nom_region, g.code_region
+        ORDER BY nb_offres DESC
+    """, engine)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_carte_departements():
+    engine = get_engine()
+    return pd.read_sql("""
+        SELECT
+            g.nom_departement                                      AS nom,
+            g.code_departement                                     AS code,
+            g.nom_region,
+            COUNT(*)                                               AS nb_offres,
+            COUNT(DISTINCT f.company_key)                         AS nb_entreprises,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0), 0)    AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP
+                  (ORDER BY (f.salary_min_computed + f.salary_max_computed) / 2.0)::numeric, 0) AS salaire_mediane,
+            COUNT(*) FILTER (WHERE f.published_at >= NOW() - INTERVAL '30 days') AS offres_30j
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        WHERE g.nom_departement IS NOT NULL
+          AND g.code_departement != 'UNKNOWN'
+        GROUP BY g.nom_departement, g.code_departement, g.nom_region
+        ORDER BY nb_offres DESC
+    """, engine)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_top_contrats_zone(zone_type: str, zone_nom: str):
+    """Top 5 contrats pour une région ou un département donné."""
+    engine = get_engine()
+    col = "g.nom_region" if zone_type == "region" else "g.nom_departement"
+    return _sql(f"""
+        SELECT c.contract_type, COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+        JOIN gold.dim_type_contrat c ON c.contract_key = f.contract_key
+        WHERE {col} = :zone_nom
+          AND c.contract_type != 'UNKNOWN'
+        GROUP BY c.contract_type
+        ORDER BY nb DESC
+        LIMIT 5
+    """, engine, params={"zone_nom": zone_nom})
+
+
+# ── Flux de publication (jour ou semaine) ─────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_offres_par_periode(granularite: str = "semaine", filters_key: str = ""):
+    """
+    granularite : 'jour' ou 'semaine'
+    Retourne nb offres par jour / semaine sur les 365 derniers jours.
+    """
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    trunc = "week" if granularite == "semaine" else "day"
+    sql = f"""
+        SELECT
+            DATE_TRUNC('{trunc}', f.published_at)::date AS periode,
+            COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.published_at >= NOW() - INTERVAL '365 days'
+          {where_sql}
+        GROUP BY 1
+        ORDER BY 1
+    """
+    return _sql(sql, engine, params=params)
+
+
+# ── Codes NAF par région ──────────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_naf_par_region(region: str = "", top_n: int = 20, filters_key: str = ""):
+    """
+    Retourne le top N des codes NAF (naf_code + naf_label) pour une région donnée.
+    Si region est vide, retourne le top global.
+    """
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    region_clause = ""
+    if region and region != "Toutes":
+        region_clause = "AND g.nom_region = :region"
+        params["region"] = region
+    params["top_n"] = int(top_n)
+    sql = f"""
+        SELECT
+            n.naf_code,
+            n.naf_label,
+            COUNT(*)                                               AS nb_offres,
+            ROUND(AVG((f.salary_min_computed + f.salary_max_computed) / 2.0), 0)   AS salaire_moyen
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_naf n       ON n.naf_key  = f.naf_key
+        JOIN gold.dim_geo g       ON g.geo_key  = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE n.naf_code IS NOT NULL
+          AND n.naf_code != 'UNKNOWN'
+          {region_clause}
+          {where_sql}
+        GROUP BY n.naf_code, n.naf_label
+        ORDER BY nb_offres DESC
+        LIMIT :top_n
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_naf_par_region_salaire_stats(region: str = "", top_n: int = 20, filters_key: str = ""):
+    """
+    NAF avec volume d'offres + stats de salaire (min/p25/moy/p75/max).
+    Le volume (nb_offres) inclut toutes les offres selon les filtres,
+    tandis que les stats salaire ne considèrent que les salaires plausibles.
+    """
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+
+    region_clause = ""
+    if region and region != "Toutes":
+        region_clause = "AND g.nom_region = :region"
+        params["region"] = region
+
+    params["top_n"] = int(top_n)
+    sql = f"""
+        SELECT
+            n.naf_code,
+            n.naf_label,
+            COUNT(*) AS nb_offres,
+            ROUND(
+                AVG(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_moyen,
+            ROUND(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p25,
+            ROUND(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN f.salary_min_computed IS NOT NULL
+                             AND f.salary_max_computed IS NOT NULL
+                             AND f.salary_min_computed > 0
+                             AND f.salary_max_computed < 200000
+                        THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                )::numeric,
+                0
+            ) AS salaire_p75,
+            ROUND(
+                MIN(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_min,
+            ROUND(
+                MAX(
+                    CASE WHEN f.salary_min_computed IS NOT NULL
+                              AND f.salary_max_computed IS NOT NULL
+                              AND f.salary_min_computed > 0
+                              AND f.salary_max_computed < 200000
+                         THEN (f.salary_min_computed + f.salary_max_computed) / 2.0
+                    END
+                ),
+                0
+            ) AS salaire_max
+        FROM gold.fact_offre_emploi f
+        JOIN gold.dim_naf n       ON n.naf_key  = f.naf_key
+        JOIN gold.dim_geo g       ON g.geo_key  = f.geo_key
+        {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE n.naf_code IS NOT NULL
+          AND n.naf_code != 'UNKNOWN'
+          {region_clause}
+          {where_sql}
+        GROUP BY n.naf_code, n.naf_label
+        ORDER BY nb_offres DESC
+        LIMIT :top_n
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_regions_list(filters_key: str = ""):
+    """Liste des régions disponibles pour le filtre NAF."""
+    engine = get_engine()
+    return _sql(
+        "SELECT DISTINCT nom_region FROM gold.dim_geo "
+        "WHERE nom_region IS NOT NULL AND code_region != 'UNKNOWN' "
+        "ORDER BY nom_region",
+        engine,
+    )["nom_region"].tolist()
+
+
+# ── Offres par semaine ────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_offres_par_semaine(filters_key: str = ""):
+    """Nombre d'offres publiées par semaine — 26 dernières semaines avec label Sxx."""
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    sql = f"""
+        SELECT
+            DATE_TRUNC('week', f.published_at)::date AS semaine,
+            TO_CHAR(DATE_TRUNC('week', f.published_at), 'IYYY-IW') AS annee_semaine,
+            CONCAT('S', TO_CHAR(DATE_TRUNC('week', f.published_at), 'IW')) AS label_semaine,
+            COUNT(*) AS nb
+        FROM gold.fact_offre_emploi f
+        {_geo_join(f)} {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+        WHERE f.published_at IS NOT NULL
+          {where_sql}
+        GROUP BY 1, 2, 3 ORDER BY 1
+    """
+    return _sql(sql, engine, params=params)
+
+
+# ── Entreprises ────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_top_entreprises(filters_key: str = "", limit: int = 30):
+    """
+    Top entreprises par volume d'offres.
+    company_key est un bigint — pas de TRIM/NULLIF sur chaîne vide.
+    """
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    lim = int(limit) if limit else 30
+    params["lim"] = lim
+    sql = f"""
+        WITH base AS (
+            SELECT
+                f.company_key       AS entreprise,
+                f.naf_key,
+                (f.salary_min_computed + f.salary_max_computed) / 2.0 AS salaire_moyen_offre
+            FROM gold.fact_offre_emploi f
+            JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+            {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+            WHERE f.company_key IS NOT NULL
+              {where_sql}
+        ),
+        top_companies AS (
+            SELECT
+                entreprise,
+                COUNT(*) AS nb_offres,
+                ROUND(AVG(salaire_moyen_offre) FILTER (WHERE salaire_moyen_offre IS NOT NULL), 0) AS salaire_moyen
+            FROM base
+            GROUP BY entreprise
+            ORDER BY nb_offres DESC
+            LIMIT :lim
+        ),
+        naf_rank AS (
+            SELECT
+                b.entreprise,
+                n.naf_code,
+                n.naf_label,
+                COUNT(*) AS nb,
+                ROW_NUMBER() OVER (
+                    PARTITION BY b.entreprise
+                    ORDER BY COUNT(*) DESC, n.naf_code
+                ) AS rn
+            FROM base b
+            JOIN top_companies t ON t.entreprise = b.entreprise
+            LEFT JOIN gold.dim_naf n ON n.naf_key = b.naf_key
+            WHERE n.naf_code IS NOT NULL
+              AND n.naf_code != 'UNKNOWN'
+            GROUP BY b.entreprise, n.naf_code, n.naf_label
+        )
+        SELECT
+            t.entreprise,
+            t.nb_offres,
+            t.salaire_moyen,
+            nr.naf_code,
+            nr.naf_label
+        FROM top_companies t
+        LEFT JOIN naf_rank nr
+          ON nr.entreprise = t.entreprise
+         AND nr.rn = 1
+        ORDER BY t.nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
+
+
+@st.cache_data(ttl=DB_TTL, show_spinner=False)
+def load_top_entreprises_candles(filters_key: str = "", limit: int = 30):
+    """
+    Top entreprises par volume d'offres avec stats salariales
+    pour affichage en "bougies" (min / p25 / moyenne / p75 / max).
+    Jointure sur dim_company pour afficher company_name.
+    """
+    engine = get_engine()
+    f = st.session_state.get("active_filters", {})
+    where_sql, params = _build_where(f)
+    lim = int(limit) if limit else 30
+    params["lim"] = lim
+    sql = f"""
+        WITH base AS (
+            SELECT
+                f.company_key,
+                (f.salary_min_computed + f.salary_max_computed) / 2.0 AS salaire_moyen_offre
+            FROM gold.fact_offre_emploi f
+            JOIN gold.dim_geo g ON g.geo_key = f.geo_key
+            {_contrat_join(f)} {_company_join(f)} {_rome_join(f)}
+            WHERE f.company_key IS NOT NULL
+              {where_sql}
+        ),
+        top_companies AS (
+            SELECT company_key, COUNT(*) AS nb_offres
+            FROM base
+            GROUP BY company_key
+            ORDER BY nb_offres DESC
+            LIMIT :lim
+        )
+        SELECT
+            COALESCE(NULLIF(TRIM(c.company_name), ''), 'Entreprise #' || t.company_key::text) AS entreprise,
+            t.nb_offres,
+            ROUND(AVG(b.salaire_moyen_offre) FILTER (WHERE b.salaire_moyen_offre IS NOT NULL), 0) AS salaire_moyen,
+            ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY b.salaire_moyen_offre)::numeric, 0) AS salaire_p25,
+            ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY b.salaire_moyen_offre)::numeric, 0) AS salaire_p75,
+            ROUND(MIN(b.salaire_moyen_offre), 0) AS salaire_min,
+            ROUND(MAX(b.salaire_moyen_offre), 0) AS salaire_max
+        FROM top_companies t
+        LEFT JOIN gold.dim_company c ON c.company_key = t.company_key
+        JOIN base b ON b.company_key = t.company_key
+        GROUP BY t.company_key, c.company_name, t.nb_offres
+        ORDER BY t.nb_offres DESC
+    """
+    return _sql(sql, engine, params=params)
